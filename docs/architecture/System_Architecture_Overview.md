@@ -1,0 +1,451 @@
+# System Architecture Overview
+
+Update date: 2026-04-29
+Status: Increment 32
+
+## 1. Target architectural landmark
+
+The system is built according to the model from `./docs`:
+
+- LangGraph as a single orchestration runtime;
+- OOP framework layer with typed contracts;
+- domain packages on top of framework abstractions;
+- infra adapters with isolation of concrete integrations;
+- FastAPI + FastMCP at service boundaries;
+- PostgreSQL + pgvector for state, metadata and vectors.
+
+## 2. Current implementation (Increment 32)
+
+Implemented:
+
+- framework and schemas layer;
+- root roadmap `BACKLOG.md` to complete the backend/framework part;
+- framework extension guide `docs/framework_extension_guide.md`;
+- contract tests for basic framework agents/tools/mcp/db/stores;
+- first slice of Framework Runtime Closure:
+- `ToolExecutor` supports `ToolExecutionPolicy`;
+- added retry, timeout accounting, idempotency key handling and audit records for tool calls;
+- `ToolContext` expanded `node_name`, `correlation_id`, `idempotency_key`;
+- added in-memory audit sink for unit/dev contract tests.
+- second slice of Framework Runtime Closure:
+- `BaseWorkflow` supports `workflow_nodes(is_resume=...)` and `WorkflowNodeSpec`;
+- LangGraph invoke/resume graphs are compiled from sequential node specs;
+- fallback runtime also executes node specs;
+- `WorkflowExecutionContext` throws `workflow_name`, `node_name`, `task_id`, `correlation_id`, `is_resume`, `metadata`;
+- `SubgraphWorkflow` supports `subgraph_name`, `invoke_as_subgraph(...)` and parent context propagation.
+- third slice of Framework Runtime Closure:
+- `BaseWorkflow` issues `WorkflowNodeEventRecord` for node `started/completed/failed`;
+- `TaskWorkflowNodeEventSink` saves workflow node events to the existing `task_events` read-model;
+- node events are available via the existing `GET /api/v1/tasks/events` without changing the API schemas;
+- retrieval and knowledge-indexing workflows are connected to node-level audit.
+- fourth slice of Framework Runtime Closure:
+- `WorkflowFactory` supports DI-friendly builders via `register_builder(...)`;
+- `build(..., **dependencies)` passes dependencies to the workflow builder;
+- duplicate/missing registry paths raise `WorkflowRegistrationError`/`WorkflowNotRegisteredError`;
+- factory stores workflow capability metadata.
+- Knowledge Factory MVP:
+- canonical document contracts in `schemas.documents`;
+  - `domain_docs` package;
+- `CanonicalDocumentParser` for `.md/.txt/.json/.docx/.pdf/.xlsx/.pptx`;
+  - `KnowledgeIndexingWorkflow`;
+  - `CanonicalDocumentApplicationService`;
+  - `PostgresCanonicalDocumentStore`;
+- API endpoints `POST /api/v1/tasks/retrieval/start`, `POST /api/v1/tasks/retrieval/start_async`, `POST /api/v1/tasks/knowledge-indexing/start` and `POST /api/v1/tasks/knowledge-indexing/start_async`;
+  - smoke `backend/scripts/smoke_knowledge_indexing.sh/.ps1`;
+  - API task smoke `backend/scripts/smoke_knowledge_indexing_api.sh/.ps1`;
+  - binary demo input generator `backend/scripts/build_binary_demo_documents.sh/.ps1`;
+  - canonical release go/no-go report with quality/source mapping.
+- Knowledge Factory Hardening / parser quality baseline:
+- `CanonicalDocument` extended typed `parser_quality` read-model;
+- parser diagnostics contain `parser_family`, `extraction_mode`, page/block/heading/list/table counters and typed issues;
+- DOCX path extracts `CanonicalTable` and `table_row` blocks for retrieval/indexing corpus;
+- PDF path without extractable text marks the document as `ocr_required`;
+- knowledge indexing task details and aggregate quality summary return parser diagnostics by `doc_id` and fields `parser_families`, `extraction_modes`, `parser_issues_total`, `documents_with_tables`, `documents_needing_ocr`;
+- canonical retrieval/report path passes `parser_quality` to source metadata and release-readiness report.
+- Knowledge Factory Hardening / OCR fallback slice:
+- added `PdfOcrGateway` boundary for scanned PDF recovery path;
+- default/demo OCR path uses deterministic sidecar OCR fixture, and production-like path supports `ocrmypdf` CLI;
+- PDF parser now tries OCR fallback after `pdf_no_extractable_text` and writes `ocr_applied`, `ocr_provider:*`, `ocr_not_available`, `ocr_text_not_recovered` quality flags;
+- multifile demo now includes a scanned PDF fixture for manually checking the OCR script.
+- Knowledge Factory Hardening / DOCX structure slice:
+- DOCX parser now extracts `CanonicalTable` and table rows as canonical `table_row` blocks;
+- numbered/list paragraphs are normalized as semantic list blocks;
+- appendix-like headings are marked via `appendix_section_detected`;
+- multifile demo DOCX fixture now contains a real approval matrix table, checklist and appendix section.
+- Knowledge Factory Hardening / retrieval provenance slice:
+- canonical indexing and vector metadata now preserve table-aware provenance for `table_row` blocks;
+- canonical retrieval/detail candidates give `source_kind`, `table_id`, `table_title`, `table_columns`, `row_index`, `row_values`;
+- `lookup_source` returns typed source provenance and table payload for table-backed evidence;
+- release readiness report shows table-aware canonical source mapping for evidence coming from the approval matrix.
+- Knowledge Factory Hardening / PDF page provenance slice:
+- PDF parser uses global-per-document `block_id` to eliminate collisions on multi-page documents;
+- canonical blocks/retrieval metadata for PDF now includes `source_kind=page_block`, `page_number`, `layout_source`, `bbox`;
+- `lookup_source` and release report source mapping now show page refs/layout source for PDF evidence.
+- Knowledge Factory Hardening / PDF layout semantics baseline slice:
+- PDF parser now sets `reading_order_index` and `layout_kind=paragraph|table_like` for page blocks;
+- parser quality flags include `pdf_table_like_blocks_detected` for table-like layout blocks;
+- retrieval metadata/MCP lookup/report source mapping now preserves layout-kind and reading-order hints.
+- Knowledge Factory Hardening / PDF table extraction baseline slice:
+- table-like PDF blocks are now extracted into canonical `extracted_tables` with `PDF-T-*` table ids;
+- table rows are included in the canonical corpus as `table_row` blocks;
+- parser quality flags include `pdf_tables_extracted` if table extraction is successful.
+- form-like key/value blocks are supported by the same tabular extraction path with quality flag `pdf_form_like_blocks_detected`.
+- Knowledge Factory Hardening / PDF extraction coverage slice:
+- parser considers table-like coverage counters (`candidates_total/extracted`, `rows_extracted/failed`, `coverage_percent`);
+- partial extraction is marked with quality flag `pdf_table_extraction_partial`;
+- indexing quality summary aggregates `documents_with_pdf_table_partial` and `documents_with_pdf_form_like`.
+- Knowledge Factory Hardening / PDF form-confidence slice:
+- parser diagnostics for `pdf_form_like_blocks_detected` now include `key_value_pairs_total/extracted`, `field_fill_rate_percent` and `form_confidence_score`;
+- indexing quality policy adds synthetic flag `pdf_form_confidence_low` when the score is below env-threshold;
+- quality summary aggregates `documents_with_pdf_form_confidence_low` and returns `form_confidence_min_score` + `pdf_form_confidence_by_doc`.
+- Knowledge Factory Hardening / PDF multi-line & rotated hardening slice:
+- form-like parser supports keys with spaces/hyphens and multi-line continuation values;
+- PDF metadata now marks `rotated_text=true|false` for page/table blocks;
+- parser quality flags includes `pdf_rotated_layout_detected` with rotated candidate diagnostics.
+- Knowledge Factory Hardening / OCR confidence calibration slice:
+- parser issue `ocr_applied` now contains OCR diagnostics (`ocr_blocks_total`, `ocr_words_total`, `ocr_weird_char_ratio_percent`, `ocr_confidence_score`);
+- indexing quality policy adds synthetic flag `ocr_confidence_low` when score is below env-threshold;
+- quality summary aggregates `documents_with_ocr_confidence_low` and returns `ocr_confidence_min_score` + `ocr_confidence_by_doc`.
+- Knowledge Factory Hardening / merged-table + demo-proof slice:
+- pipe-like PDF tables support merged/wrapped continuation rows and markdown separator rows;
+- smoke outputs (direct/API) give `pdf_demo_proof` for `06_audit_summary.pdf` as acceptance proof extraction path.
+- Knowledge Factory Hardening / XLSX parser slice:
+- canonical parser now supports `.xlsx` via `openpyxl`;
+- workbook sheets become structural sections/heading path source;
+- table sheets are extracted into canonical `extracted_tables`;
+- sheet tables rows end up in the retrieval corpus as `table_row` blocks;
+- multifile demo input extended `08_release_tracker.xlsx` for manual checking of Excel ingestion path.
+- Knowledge Factory Hardening / PPTX parser slice:
+- canonical parser now supports `.pptx` via `python-pptx`;
+- slides become structural sections, and title/body/notes end up in canonical content blocks;
+- parser diagnostics reflect slide counters and notes flags;
+- multifile demo input extended `09_release_briefing.pptx` for manual checking of presentation ingestion path.
+- Knowledge Factory Hardening / canonical version policy slice:
+- canonical store now separates latest read-model and version history for documents/knowledge blocks;
+- `CanonicalDocumentApplicationService` supports latest lookup by `doc_id`, explicit lookup by `doc_id + version` and `list_versions(...)`;
+- knowledge indexing request supports `document_version`;
+- re-index semantics clear old vectors latest-version read-model by `doc_id`, but save historical canonical versions in dedicated version tables.
+- Knowledge Factory Hardening / indexing quality policy slice:
+- quality gate canonical indexing is moved to `KnowledgeIndexingQualityPolicy`;
+- policy gives per-document decisions (`accepted/rejected`) and aggregate `gate_status`;
+- rejected documents are not written to the canonical store and are not indexed to the vector store;
+- policy runtime configurable via `APP_INDEXING_QUALITY_*` env contract;
+- PDF form-confidence knobs: `APP_INDEXING_QUALITY_FORM_CONFIDENCE_MIN_SCORE` and `APP_INDEXING_QUALITY_FORM_CONFIDENCE_LOW_BLOCKING`;
+- OCR confidence knobs: `APP_INDEXING_QUALITY_OCR_CONFIDENCE_MIN_SCORE` and `APP_INDEXING_QUALITY_OCR_CONFIDENCE_LOW_BLOCKING`;
+- `quality_summary` expanded policy metadata (`policy_name`, accepted/rejected ids/counts, blocking/warning flags).
+- canonical retrieval source:
+  - `task_context.knowledge_source=canonical`;
+  - `task_context.canonical_doc_ids`;
+  - loader `load_canonical_knowledge_dataset`;
+  - `CanonicalVectorRetriever`;
+  - `CanonicalSummaryVectorRetriever`;
+- embedding write path in `app.embeddings`;
+- pgvector-backed summary/detail retrieval if there is an embedding gateway and vector store;
+- TEI HTTP adapters for `/embed` and `/rerank` with env configuration and explicit fallback;
+- retrieval quality gates write `quality_gate_status`, `unresolved_gaps`, `confidence_notes`;
+  - smoke `backend/scripts/smoke_canonical_retrieval.sh/.ps1`.
+- `BaseWorkflow` with LangGraph-backed compile/invoke/resume;
+- API boundary + task lifecycle + interrupt/resume branches;
+- persistence adapters:
+  - `PostgresDocumentRepository`;
+  - `PostgresArtifactStore`;
+  - `LangGraphPostgresCheckpointStore`;
+  - `PgVectorStoreAdapter`;
+- `PostgresSettings` from env (`APP_DB_DSN`, `APP_DB_SCHEMA`, `APP_VECTOR_DIM`, `APP_RUNTIME_PROFILE`).
+- runtime profiles:
+  - `dev`, `stage`, `prod`;
+- fallback persistence is enabled in `dev/stage` and disabled in `prod`.
+- SQL migrations:
+  - `backend/migrations/0001_baseline.sql`;
+  - `backend/migrations/0002_task_registry.sql`;
+  - `backend/migrations/0003_task_events.sql`;
+  - `backend/migrations/0004_langgraph_checkpoint_storage.sql`;
+  - `backend/migrations/0005_task_events_status_filter_indexes.sql`;
+  - `backend/migrations/0006_artifact_store.sql`;
+  - `backend/migrations/0007_task_artifacts.sql`;
+  - `backend/migrations/0008_hitl_actions.sql`;
+  - `backend/migrations/0009_canonical_knowledge_store.sql`;
+  - `backend/migrations/0013_canonical_document_versions.sql`.
+- task history API:
+  - `GET /api/v1/tasks`;
+- filters `status`, `task_type`, `from`, `to`;
+- cursor pagination (`cursor`, `next_cursor`, `has_more`);
+- sorting `updated_at DESC, task_id DESC`.
+- task events API:
+  - `GET /api/v1/tasks/events`;
+- filters `task_id`, `task_type`, `from_status`, `to_status`, `from`, `to`;
+- cursor pagination (`cursor`, `next_cursor`, `has_more`);
+- sorting `created_at DESC, event_id DESC`.
+- task events summary API:
+  - `GET /api/v1/tasks/events/summary`;
+- filters `task_id`, `task_type`, `from_status`, `to_status`, `from`, `to`;
+- aggregates `total_events`, `unique_tasks`, `transitions(from_status,to_status,total)`;
+- time buckets `daily[]` and `weekly[]` (`bucket_start`, `total_events`, `unique_tasks`).
+- task observability summary API:
+  - `GET /api/v1/tasks/observability/summary`;
+- filters `status`, `task_type`, `from`, `to`;
+- current-state counts, async totals and latency/queue wait aggregates by `task_type`;
+  - execution quality/token aggregates: `avg_selected_block_count`, `avg_confidence`, `tasks_with_unresolved_gaps`, `unresolved_gaps_total`, `llm_tokens_*`;
+  - SLA aggregates:
+- `p50/p95` for `duration_ms` and `queue_wait_ms`;
+    - env-driven thresholds/breaches (`APP_SLA_TASK_DURATION_MS`, `APP_SLA_QUEUE_WAIT_MS`);
+- period buckets `daily[]/weekly[]` with completed/failed/waiting_human breakdown.
+- authoring API:
+  - `POST /api/v1/tasks/authoring/start`;
+  - `POST /api/v1/tasks/authoring/start_async`;
+  - `GET /api/v1/tasks/{task_id}/artifact`;
+  - `GET /api/v1/tasks/{task_id}/hitl`;
+  - `POST /api/v1/tasks/{task_id}/hitl/submit`;
+  - `GET /api/v1/hitl/actions`;
+  - traceability payload: `retrieval_task_id`, `source_refs`, `sections`;
+  - `draft_strategy`: `auto|deterministic|llm`;
+  - `workflow_mode`: `single_pass|multi_step`;
+  - `hitl_required`: bool.
+- audit of status transitions:
+- table `app.task_events`;
+- an event when a task is created and every time the `status` changes.
+- unified async execution slices:
+- existing async dispatcher plane is no longer limited to authoring and now covers `knowledge_indexing` and `retrieval`;
+- `KnowledgeIndexingApplicationService` supports queued execution via `start_task_async(...)` and worker-side `run_existing_task(...)`;
+- `RetrievalApplicationService` supports queued execution via `start_async(...)` and worker-side `run_existing_task(...)`;
+- Celery worker app listens to the `authoring`, `knowledge-indexing` and `retrieval` queues;
+- worker runtime normalizes host `source_paths` in `/workspace/...` for docker-compose bind mount only for indexing path;
+- execution metadata now captures `correlation_id`, `async_provider`, `queue_name`, `queued_at`, `started_at`, `completed_at|failed_at`, `queue_wait_ms`;
+- lifecycle details also include `duration_ms` if `started_at` and `completed_at|failed_at` are present;
+- observability aggregates are built on top of the existing task registry/task details without a separate telemetry storage branch;
+- Docker/Celery e2e confirms async path `queued -> running -> completed` for canonical indexing and retrieval.
+- production checkpointer for LangGraph:
+- `PostgresLangGraphCheckpointer` implements `BaseCheckpointSaver`;
+- runtime storage in the tables `app.langgraph_checkpoints`, `app.langgraph_checkpoint_blobs`, `app.langgraph_checkpoint_writes`;
+- `delete_thread`, `copy_thread`, `prune(strategy=keep_latest|delete)` operations are supported;
+- `BaseWorkflow` passes `configurable.thread_id` from `task_context.task_id`.
+- local PostgreSQL deployment profile:
+  - `backend/docker-compose.postgres.yml`;
+  - scripts: `postgres_up/down/migrate` (`.ps1` + `.sh`), `apply_migrations` (`.ps1` + `.sh`), smoke/demo.
+- smoke/demo added with `events/summary` check.
+- production runbook/handoff baseline:
+- `docs/production_runbook.md` describes deploy/migrate/smoke/backup/restore/rollback/release gate for stage/prod rehearsal;
+- `docs/handoff/2026-04-27_increment_30_production_boundary_handoff.md` fixes the handoff checklist for Increment 30.
+- unified release-gate smoke matrix:
+- `backend/scripts/smoke_release_gate.sh/.ps1/.py` collects proof payload from `events/summary`, `tasks/observability/summary` and `hitl/observability/summary`;
+- script returns machine-readable `gate_status=pass|fail` + `checks[]` with expected/actual;
+- thresholds are configured via `APP_RELEASE_GATE_*` env contract and optional `APP_RELEASE_GATE_REQUIRE_LLM_TOKENS`;
+- policy profiles `dev|stage|prod` give baseline presets, and checks contain short triage-codes `RG001..RG012`.
+- final release decision orchestrator:
+- `backend/scripts/release_decision_gate.sh/.ps1/.py` combines `smoke_release_gate` and full pytest gate;
+- generates a unified verdict artifact (`status`, `decision_reason`, `failed_checks`, `test_gate_summary`, `commit_sha`) in `backend/.release_gate`.
+- external developer documentation surface:
+- single docs entrypoint `docs/developer_guide/README.md`;
+- practical usage/ops/extension guides for external integrators;
+- manual demo proof path (including PDF/PPTX canonical parsing checks) without changing API/runtime contracts.
+- file-based demo pipeline for release readiness:
+- input markdown `release_packet.md` -> generation of retrieval dataset JSON;
+- launch retrieval via `case_dataset_path`;
+- generation of the final markdown report `release_readiness_report.md` with GO/NO-GO interpretation.
+- multi-file ingestion for retrieval:
+- support for `task_context.case_dataset_dir`;
+- ingestion of directories with `.md/.txt/.json` files into summary/detail blocks;
+- new demo case `release_go_no_go_multifile_case`.
+- Retrieval MCP MVP:
+  - app entrypoint `apps/mcp_retrieval/main.py`;
+- service `FastMcpRetrievalService`;
+  - MCP tools: `build_evidence_pack`, `search_summaries`, `search_blocks`, `lookup_source`;
+- indexed canonical search tools use `CanonicalSummaryVectorRetriever`/`CanonicalVectorRetriever`;
+- `lookup_source` reads canonical source mapping via `CanonicalDocumentApplicationService`.
+  - operational smoke: `backend/scripts/smoke_retrieval_mcp.sh/.ps1`.
+- Repository MCP MVP:
+  - app entrypoint `apps/mcp_repository/main.py`;
+- service `FastMcpRepositoryService`;
+  - MCP tools: `upsert_document`, `get_document`, `list_documents`.
+- Artifact Writer MCP MVP:
+  - app entrypoint `apps/mcp_artifact_writer/main.py`;
+- service `FastMcpArtifactWriterService`;
+  - MCP tools: `write_artifact`, `get_artifact`, `list_artifacts`.
+- Template Library MCP boundary:
+  - app entrypoint `apps/mcp_template_library/main.py`;
+- service `FastMcpTemplateLibraryService`;
+  - MCP tools: `upsert_template`, `publish_template`, `set_template_status`, `get_template`, `list_templates`;
+- the service uses the existing `TemplateLibraryApplicationService` without a separate template-specific runtime stack.
+- Review/Approval MCP boundary:
+  - app entrypoint `apps/mcp_review_approval/main.py`;
+- service `FastMcpReviewApprovalService`;
+  - MCP tools: `get_hitl_status`, `list_hitl_actions`, `submit_hitl_review`, `get_hitl_observability_summary`;
+- boundary uses the existing `AuthoringApplicationService`, existing HITL read-model and existing async dispatcher plane without a separate reviewer-specific runtime stack.
+- Configuration Library MCP skeleton:
+  - app entrypoint `apps/mcp_configuration_library/main.py`;
+- service `FastMcpConfigurationLibraryService`;
+  - application boundary `ConfigurationLibraryApplicationService`;
+  - persistence `PostgresConfigurationStore` + migration `0012_configuration_library.sql`;
+  - MCP tools: `upsert_config`, `get_config`, `list_configs`, `find_similar_configs`, `compare_configs`;
+- similarity and compare work in a deterministic way on top of persisted config records, without a separate semantic/vector runtime.
+- unified FastMCP policy baseline:
+- `BaseFastMcpService` centralizes the metadata contract, tool naming validation and operation-scope policy;
+- service metadata now consistently contains `transport`, `service_scope`, `policy_version`, `tool_names`, `operation_scopes`, `auth_policy`, `tool_required_roles`, validation markers and `audit_payload_fields`;
+- current MCP services use a single helper for MCP-friendly error mapping instead of a local manual `raise ValueError(str(exc))`.
+- RBAC boundary baseline:
+- shared `framework.security.rbac` normalizes `ActorContext` and role parsing for API/MCP boundaries;
+- FastAPI sensitive endpoints use header-based actor context (`X-Actor-Id`, `X-Actor-Roles`) and with `APP_AUTH_ENABLED=true` enforce minimal role checks;
+- FastMCP sensitive tools use typed `actor`/`roles` payload and the same shared role policy helper;
+  - current protected operations: template governance (`template_admin`), reviewer/HITL submit (`reviewer`), config upsert (`config_admin`), artifact write (`artifact_writer`), repository upsert (`repository_writer`).
+- Authoring application flow:
+  - `AuthoringApplicationService`;
+  - orchestration `retrieval -> research -> writer -> reviewer -> assembly -> artifact`;
+  - current `domain_authoring` extraction: `OutlinePlanner`, `SectionReviewService`, `DocumentAssembler`, `ResearchSummaryBuilder`, `WriterDraftService`;
+- traceability mapping and HITL feedback formatting are also included in `domain_authoring` services;
+- introduced typed `SectionContract`/`SectionPacket` as baseline for section-oriented authoring;
+- added `SectionAuthoringService`, which builds section-level deterministic artifacts/digests;
+- added baseline `SectionAuthoringWorkflow` on top of `SectionAuthoringState` and workflow nodes `write_section -> review_section -> finalize_section`;
+- added baseline `DocumentAssemblyWorkflow` on top of `AssemblyWorkflowState` and workflow nodes `assemble_document -> export_artifact -> finalize_document`;
+- `AuthoringApplicationService` now conducts final assembly/export through the document workflow boundary;
+- template-aware contracts are supported via `domain_docs.TemplateCompiler` and `task_context.template_id/template_payload`;
+- final assembly can now use `TemplateSpec` + `section_artifacts` for template-driven documents;
+- baseline `TemplateCatalog` and `TemplateSpec.assembly_rules` prepared for reusable template library path; assembly rules already control section order, writer-draft visibility, traceability visibility, include/exclude filters and section-group scoping;
+- template sections support richer inclusion policy (`required`, `include_if_has_evidence`, `include_if_review_status`, `section_group`), and markdown/json export reuse the same deterministic section-selection path;
+- `OutlinePlanner` now builds template-aware section traceability for custom templates as well, so traceability is no longer tied only to the release-readiness default layout;
+- added persisted template library via `TemplateLibraryApplicationService` and `PostgresTemplateStore`, and authoring can resolve versioned templates by `template_id/template_version`;
+- template library received a public API boundary for upsert/get/list reusable templates;
+- template library received lifecycle `draft|published|deprecated|archived`, explicit status transition path and governance metadata/history; publish semantics is exclusive, that is, the new publish will automatically demote the previous published version of the same `template_id`;
+- authoring without an explicit `template_version` now requires a published version, explicit archived version is not allowed, and deprecated version can only be used with an explicit version lookup;
+- added baseline `ArtifactExporter`, which separates the assembly from the final rendering and already supports `markdown|json`;
+- persistence link `task -> artifact` via `PostgresTaskArtifactRegistry`;
+- optional real LLM draft generation via OpenRouter gateway;
+- fallback in deterministic draft when LLM is unavailable (if strict-mode is disabled);
+- steps read-model in task details and artifact metadata (`steps_summary`);
+- supported pause status `waiting_human` and resuming by `hitl/submit`;
+- with `hitl_required=true` multi-step authoring now first puts an outline approval pause (`phase=outline_review`) and sends an outline snapshot via HITL read-model.
+- async execution circuit:
+  - Celery worker app: `apps/worker/celery_app.py` + `apps/worker/tasks.py`;
+  - dispatcher policy: `APP_ASYNC_PROVIDER=inline|celery`;
+- docker deployment for queue: `backend/docker-compose.async.yml` (`redis` + `celery-worker`);
+- real Docker/Celery e2e covers approve-flow and iterative HITL flow;
+  - operational scripts: `backend/scripts/async_up/down.sh(.ps1)`.
+- iterative HITL contour:
+- `hitl/submit` supports `idempotency_key` and `expected_iteration`;
+- continuation after submit is executed via async dispatcher (`enqueue_hitl_action`);
+- worker task `run_authoring_hitl_action` handles approve/reject/needs_changes;
+- `needs_changes` runs rewrite + reviewer rerun and moves the task into a new `waiting_human` iteration;
+- introduced iteration limits and SLA deadline (`APP_HITL_MAX_ITERATIONS`, `APP_HITL_WAIT_TIMEOUT_SEC`).
+- HITL persistence/read-model:
+- separate adapter `PostgresHitlActionStore`;
+- reviewer actions are saved in the `app.hitl_actions` table;
+- history API `GET /api/v1/hitl/actions` supports `task_id/decision/status/reviewer/from/to` and cursor pagination filters.
+- HITL observability and runtime logging:
+- `HitlActionStore.summarize_actions(...)` builds reviewer aggregates on top of existing `app.hitl_actions`;
+- API endpoint `GET /api/v1/hitl/observability/summary` returns decision mix, pending/completed counts, iteration stats and reviewer load;
+- shared helper `infra.logging.runtime` emits structured JSON logs in FastAPI, Celery worker and authoring/HITL orchestration paths.
+- document application layer:
+- `DocumentApplicationService` for repository domain operations;
+- list operation in `PostgresDocumentRepository` (`limit/offset`) for MCP read-model.
+- artifact application layer:
+- `ArtifactApplicationService` for artifact store operations;
+- list operation in `PostgresArtifactStore` (`limit/offset`, filter `artifact_type`).
+- improved operational stability of smoke/demo:
+- priority of `./.venv` interpreter in `.sh/.ps1` scripts;
+- explicit check of `uvicorn` before running the API in smoke scripts.
+- added MCP scripts for the repository circuit:
+  - `backend/scripts/run_repository_mcp.sh/.ps1`;
+  - `backend/scripts/smoke_repository_mcp.sh/.ps1` + `smoke_repository_mcp.py`.
+- added MCP scripts for artifact writer circuit:
+  - `backend/scripts/run_artifact_writer_mcp.sh/.ps1`;
+  - `backend/scripts/smoke_artifact_writer_mcp.sh/.ps1` + `smoke_artifact_writer_mcp.py`.
+- added MCP scripts for the circuit template library:
+  - `backend/scripts/run_template_library_mcp.sh/.ps1`;
+  - `backend/scripts/smoke_template_library_mcp.sh/.ps1` + `smoke_template_library_mcp.py`.
+- added authoring API scripts:
+  - `backend/scripts/smoke_authoring_api.sh/.ps1` + `smoke_authoring_api.py`;
+  - `backend/scripts/demo_release_authoring_traceability_case.sh/.ps1`.
+- added async authoring scripts:
+  - `backend/scripts/smoke_authoring_async_api.sh/.ps1` + `smoke_authoring_async_api.py`;
+  - `backend/scripts/demo_release_authoring_async_hitl_case.sh/.ps1`.
+- test coverage:
+  - unit + integration + e2e;
+- e2e with real PostgreSQL: `test_fastapi_retrieval_e2e_postgres.py`;
+- e2e coverage of starting a task with `case_dataset_path`;
+- e2e coverage of starting a task with `case_dataset_dir`;
+- external integration test with real LLM:
+- `backend/tests/integration/test_authoring_openrouter_external.py` (flag `RUN_EXTERNAL_LLM_TESTS=1`);
+- smoke script: `backend/scripts/smoke_retrieval_api.sh`.
+- architectural solutions:
+  - `docs/adr/0017-dedicated-langgraph-checkpoint-storage.md`;
+  - `docs/adr/0018-task-events-status-filters-and-summary-read-model.md`;
+  - `docs/adr/0019-file-based-demo-release-go-no-go-pipeline.md`;
+  - `docs/adr/0020-multifile-ingestion-and-retrieval-mcp-mvp.md`;
+  - `docs/adr/0021-repository-mcp-mvp-and-document-tools.md`;
+  - `docs/adr/0022-artifact-writer-mcp-mvp-and-postgres-artifact-store.md`;
+  - `docs/adr/0023-authoring-api-flow-and-task-artifact-traceability-link.md`;
+  - `docs/adr/0024-openrouter-llm-authoring-draft-gateway.md`;
+  - `docs/adr/0025-multistep-authoring-workflow-and-section-traceability.md`;
+  - `docs/adr/0026-celery-redis-async-authoring-and-hitl-mvp.md`.
+  - `docs/adr/0027-iterative-hitl-loop-and-async-submit-continuation.md`.
+  - `docs/adr/0028-hitl-actions-persistence-and-read-model-api.md`.
+  - `docs/adr/0029-framework-hardening-and-extension-guide.md`.
+  - `docs/adr/0030-canonical-document-parsing-and-indexing-mvp.md`.
+  - `docs/adr/0031-canonical-document-store-and-binary-parser-adapters.md`.
+  - `docs/adr/0032-canonical-knowledge-retrieval-source.md`.
+  - `docs/adr/0033-knowledge-block-embedding-index-and-vector-retrieval.md`.
+  - `docs/adr/0037-framework-tool-execution-policy.md`.
+  - `docs/adr/0038-workflow-node-specs-and-subgraph-context.md`.
+  - `docs/adr/0039-workflow-node-events-task-audit.md`.
+  - `docs/adr/0040-workflow-factory-di-builders.md`.
+  - `docs/adr/0041-indexed-canonical-summary-retrieval.md`.
+  - `docs/adr/0042-real-tei-embedding-and-rerank-gateways.md`.
+  - `docs/adr/0043-retrieval-quality-gates.md`.
+  - `docs/adr/0064-async-knowledge-indexing-execution-plane-first-slice.md`.
+  - `docs/adr/0065-async-retrieval-execution-plane-second-slice.md`.
+  - `docs/adr/0066-task-observability-summary-and-execution-metadata.md`.
+  - `docs/adr/0067-structured-logging-and-hitl-observability-summary.md`.
+  - `docs/adr/0068-review-approval-mcp-boundary.md`.
+  - `docs/adr/0072-canonical-parser-quality-read-model-baseline.md`.
+  - `docs/adr/0073-scanned-pdf-ocr-fallback-path.md`.
+  - `docs/adr/0075-xlsx-parser-baseline-for-canonical-ingestion.md`.
+  - `docs/adr/0076-canonical-document-version-read-model-policy.md`.
+  - `docs/adr/0077-production-indexing-quality-policy-layer.md`.
+  - `docs/adr/0078-pptx-parser-baseline-for-canonical-ingestion.md`.
+  - `docs/adr/0079-pdf-page-provenance-baseline-for-canonical-retrieval.md`.
+  - `docs/adr/0080-pdf-reading-order-and-layout-kind-baseline.md`.
+  - `docs/adr/0081-pdf-table-extraction-baseline-for-canonical-ingestion.md`.
+  - `docs/adr/0082-pdf-form-like-extraction-and-demo-fixture-hardening.md`.
+  - `docs/adr/0083-pdf-extraction-coverage-and-partial-failure-gates.md`.
+  - `docs/adr/0044-retrieval-mcp-indexed-canonical-tools.md`;
+  - `docs/adr/0045-domain-authoring-minimal-service-extraction.md`;
+  - `docs/adr/0046-domain-authoring-research-writer-composition.md`;
+  - `docs/adr/0047-domain-authoring-traceability-and-hitl-feedback-helpers.md`;
+  - `docs/adr/0048-domain-authoring-section-contracts-and-packets.md`;
+  - `docs/adr/0049-domain-authoring-section-authoring-service-baseline.md`;
+  - `docs/adr/0050-template-compiler-and-template-aware-section-contracts.md`;
+  - `docs/adr/0051-template-aware-deterministic-assembly.md`;
+  - `docs/adr/0052-template-catalog-and-assembly-rules-baseline.md`;
+  - `docs/adr/0053-artifact-exporter-baseline-for-template-aware-authoring.md`;
+  - `docs/adr/0054-outline-approval-hitl-point.md`;
+  - `docs/adr/0055-section-authoring-workflow-baseline.md`;
+  - `docs/adr/0056-document-assembly-workflow-baseline.md`.
+  - `docs/adr/0059-template-library-mcp-boundary.md`;
+  - `docs/adr/0060-template-library-governance-status-baseline.md`.
+  - `docs/adr/0061-rich-template-assembly-policy-baseline.md`.
+  - `docs/adr/0062-exclusive-published-template-version-policy.md`.
+
+## 3. Architectural limitations of the current version
+
+- The MCP circuit already has a unified auth/policy metadata baseline for sensitive tools, but so far without rate-limit policy, signed auth and centralized audit decision logging;
+- framework runtime closure completed at the reusable workflow/tool/subgraph primitives level; the next risk is shifted to production retrieval adapters;
+- HITL is now iterative with persistence/read-model API, but there is no reviewer UI/queue dashboard and aggregates/dashboards for reviewer actions for periods;
+- persisted/public `domain_authoring` workflow layer is currently limited to the baseline `SectionAuthoringWorkflow` and `DocumentAssemblyWorkflow`, without a separate section/document read-model or public workflow endpoints;
+- `domain_authoring` already covers outline/review/assembly/research/writer composition, traceability helpers, section contracts, baseline section authoring service, template-aware contract compilation, richer template assembly policy baseline and template-aware deterministic assembly; `domain_docs` already has a persisted template library baseline, public template management API, MCP boundary, closed template governance lifecycle (`draft|published|deprecated|archived`) and exclusive published-version policy for templates;
+- `domain_docs` already covers `.md/.txt/.json/.docx/.pdf/.xlsx/.pptx`, OCR fallback, table-aware provenance, page-level PDF provenance, baseline layout semantics (`reading_order_index`, `layout_kind`) and baseline PDF table extraction, but complex forms/layout cases are not yet implemented;
+- async execution plane already covers authoring, retrieval and knowledge indexing, but so far without a common policy layer for other production workflows;
+- RBAC baseline already closes the most sensitive API/MCP operations, but there is no SSO, signed tokens, tenant-aware permissions and service-to-service auth yet;
+- production deployment runbook baseline has been added, but operational SLO/SLI metrics and dashboard remain outside the current section;
+- there is no separate materialized read-model/dashboard for audit metrics for periods.
+
+## 4. GAP to target architecture
+
+1. Increase ingestion from baseline PDF table extraction to deep rich layout extraction (forms/complex tables/reading-order hardening).
+2. Expand the indexing quality policy from env-driven baseline to persisted configuration + rollout guards.
+3. Grow reviewer observability from the current summary endpoint to periodic SLA buckets and dashboard-oriented read models.
+4. Add observability/metrics/audit dashboards and periodic aggregates for `task_events`.
+
+## 5. Plan for the next increment
+
+1. Add richer layout extraction on top of parser quality and page provenance baseline.
+2. Support persisted/rollout-aware indexing quality policy configuration.
+3. Later expand RBAC baseline to signed auth / audit decision propagation.

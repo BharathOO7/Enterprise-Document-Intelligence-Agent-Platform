@@ -1,0 +1,382 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from functools import lru_cache
+
+from application.async_dispatcher import (
+    AuthoringAsyncDispatcher,
+    InlineAuthoringAsyncDispatcher,
+    InlineKnowledgeIndexingAsyncDispatcher,
+    InlineRetrievalAsyncDispatcher,
+    KnowledgeIndexingAsyncDispatcher,
+    RetrievalAsyncDispatcher,
+)
+from application.authoring_service import AuthoringApplicationService
+from application.canonical_document_service import CanonicalDocumentApplicationService
+from application.configuration_library_service import ConfigurationLibraryApplicationService
+from application.artifact_service import ArtifactApplicationService
+from application.document_service import DocumentApplicationService
+from application.knowledge_indexing_service import KnowledgeIndexingApplicationService
+from application.template_library_service import TemplateLibraryApplicationService
+from application.retrieval_service import RetrievalApplicationService
+from application.task_service import TaskApplicationService
+from domain_docs.indexing.quality_policy import KnowledgeIndexingQualityPolicy
+from domain_docs.parsing import CanonicalDocumentParser
+from schemas.api.contracts import (
+    StartAuthoringTaskRequest,
+    StartKnowledgeIndexingTaskRequest,
+    StartRetrievalTaskRequest,
+    SubmitHitlReviewRequest,
+)
+from framework.models.interfaces import IChatModelGateway
+from infra.celery import (
+    CeleryAuthoringAsyncDispatcher,
+    CeleryKnowledgeIndexingAsyncDispatcher,
+    CeleryRetrievalAsyncDispatcher,
+)
+from infra.docs.ocr_gateway import OcrmypdfGateway, SidecarPdfOcrGateway
+from infra.openrouter import OpenRouterChatModelGateway
+from infra.postgres.checkpoint_store import LangGraphPostgresCheckpointStore
+from infra.postgres.config import PostgresSettings
+from infra.postgres.configuration_store import PostgresConfigurationStore
+from infra.postgres.artifact_store import PostgresArtifactStore
+from infra.postgres.canonical_document_store import PostgresCanonicalDocumentStore
+from infra.postgres.hitl_action_store import PostgresHitlActionStore
+from infra.postgres.document_repository import PostgresDocumentRepository
+from infra.postgres.task_artifact_registry import PostgresTaskArtifactRegistry
+from infra.postgres.template_store import PostgresTemplateStore
+from infra.postgres.task_registry import PostgresTaskRegistry
+from infra.vllm.chat_gateway import VllmChatModelGateway
+from infra.pgvector.vector_store import PgVectorStoreAdapter
+from infra.tei.embedding_gateway import TeiEmbeddingGateway
+from infra.tei.rerank_gateway import TeiRerankGateway
+
+
+@dataclass(slots=True)
+class LlmRuntimeConfig:
+    """Конфигурация подключения генеративной модели для authoring."""
+
+    enabled: bool
+    strict: bool
+    provider: str
+    model_name: str | None
+    chat_gateway: IChatModelGateway | None
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Нормализует bool-переменную окружения."""
+
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    """Читает int-переменную окружения с безопасным fallback."""
+
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_csv_set(name: str) -> set[str]:
+    """Читает CSV-переменную окружения в виде множества непустых значений."""
+
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return set()
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _build_llm_runtime_config() -> LlmRuntimeConfig:
+    """Собирает конфигурацию LLM runtime из env-переменных."""
+
+    enabled = _env_flag("APP_LLM_ENABLED", default=False)
+    strict = _env_flag("APP_LLM_STRICT", default=False)
+    provider = os.getenv("APP_LLM_PROVIDER", "openrouter").strip().lower() or "openrouter"
+
+    if not enabled:
+        return LlmRuntimeConfig(
+            enabled=False,
+            strict=strict,
+            provider="deterministic",
+            model_name=None,
+            chat_gateway=None,
+        )
+
+    if provider == "openrouter":
+        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        model_name = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini").strip() or "openai/gpt-4o-mini"
+
+        if not api_key:
+            if strict:
+                raise ValueError("APP_LLM_STRICT=true требует OPENROUTER_API_KEY")
+            return LlmRuntimeConfig(
+                enabled=True,
+                strict=strict,
+                provider=provider,
+                model_name=model_name,
+                chat_gateway=None,
+            )
+
+        gateway = OpenRouterChatModelGateway(
+            api_key=api_key,
+            model_name=model_name,
+            base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+            timeout_sec=int(os.getenv("OPENROUTER_TIMEOUT_SEC", "60")),
+            app_name=os.getenv("OPENROUTER_APP_NAME", "langgraph-document-ai-platform"),
+            app_url=os.getenv("OPENROUTER_APP_URL", "http://localhost"),
+        )
+        return LlmRuntimeConfig(
+            enabled=True,
+            strict=strict,
+            provider=provider,
+            model_name=model_name,
+            chat_gateway=gateway,
+        )
+
+    if provider == "vllm_mock":
+        model_name = os.getenv("VLLM_MODEL_NAME", "mock-vllm-model").strip() or "mock-vllm-model"
+        return LlmRuntimeConfig(
+            enabled=True,
+            strict=strict,
+            provider=provider,
+            model_name=model_name,
+            chat_gateway=VllmChatModelGateway(model_name=model_name),
+        )
+
+    if strict:
+        raise ValueError(f"Неподдерживаемый APP_LLM_PROVIDER: {provider}")
+    return LlmRuntimeConfig(
+        enabled=True,
+        strict=strict,
+        provider=provider,
+        model_name=None,
+        chat_gateway=None,
+    )
+
+
+def _build_canonical_document_parser() -> CanonicalDocumentParser:
+    ocr_enabled = _env_flag("APP_OCR_ENABLED", default=True)
+    if not ocr_enabled:
+        return CanonicalDocumentParser()
+
+    provider = os.getenv("APP_OCR_PROVIDER", "sidecar").strip().lower() or "sidecar"
+    if provider == "ocrmypdf":
+        return CanonicalDocumentParser(pdf_ocr_gateway=OcrmypdfGateway(sidecar_gateway=SidecarPdfOcrGateway()))
+    return CanonicalDocumentParser(pdf_ocr_gateway=SidecarPdfOcrGateway())
+
+
+def _build_knowledge_indexing_quality_policy() -> KnowledgeIndexingQualityPolicy:
+    """Собирает quality policy canonical indexing из env."""
+
+    policy_name = (
+        os.getenv("APP_INDEXING_QUALITY_POLICY_NAME", "default_indexing_quality_policy_v1").strip()
+        or "default_indexing_quality_policy_v1"
+    )
+    blocking_flags = _env_csv_set("APP_INDEXING_QUALITY_BLOCKING_FLAGS")
+    warning_only_flags = _env_csv_set("APP_INDEXING_QUALITY_WARNING_ONLY_FLAGS")
+    form_confidence_min_score = _env_int("APP_INDEXING_QUALITY_FORM_CONFIDENCE_MIN_SCORE", 0)
+    ocr_confidence_min_score = _env_int("APP_INDEXING_QUALITY_OCR_CONFIDENCE_MIN_SCORE", 0)
+    return KnowledgeIndexingQualityPolicy(
+        policy_name=policy_name,
+        blocking_flags=blocking_flags or None,
+        warning_only_flags=warning_only_flags or None,
+        allow_recovered_ocr=_env_flag("APP_INDEXING_ALLOW_RECOVERED_OCR", default=True),
+        ocr_recovery_blocking_flag=(
+            os.getenv("APP_INDEXING_OCR_RECOVERY_BLOCKING_FLAG", "pdf_no_extractable_text").strip()
+            or "pdf_no_extractable_text"
+        ),
+        ocr_recovery_success_flag=(
+            os.getenv("APP_INDEXING_OCR_RECOVERY_SUCCESS_FLAG", "ocr_applied").strip() or "ocr_applied"
+        ),
+        form_confidence_min_score=max(min(form_confidence_min_score, 100), 0),
+        form_confidence_low_blocking=_env_flag("APP_INDEXING_QUALITY_FORM_CONFIDENCE_LOW_BLOCKING", default=False),
+        ocr_confidence_min_score=max(min(ocr_confidence_min_score, 100), 0),
+        ocr_confidence_low_blocking=_env_flag("APP_INDEXING_QUALITY_OCR_CONFIDENCE_LOW_BLOCKING", default=False),
+    )
+
+
+def _build_knowledge_indexing_dispatcher(
+    *,
+    knowledge_indexing_service: KnowledgeIndexingApplicationService,
+) -> KnowledgeIndexingAsyncDispatcher:
+    """Собирает dispatcher запуска knowledge indexing в async режиме."""
+
+    provider = os.getenv("APP_ASYNC_PROVIDER", "inline").strip().lower() or "inline"
+
+    if provider == "celery":
+        return CeleryKnowledgeIndexingAsyncDispatcher(
+            queue_name=os.getenv("APP_CELERY_INDEXING_QUEUE", "knowledge-indexing")
+        )
+    if provider == "inline":
+        return InlineKnowledgeIndexingAsyncDispatcher(
+            runner=lambda task_id, payload: knowledge_indexing_service.run_existing_task(
+                task_id=task_id,
+                request=StartKnowledgeIndexingTaskRequest.model_validate(payload),
+            )
+        )
+
+    raise ValueError(f"Неподдерживаемый APP_ASYNC_PROVIDER: {provider}")
+
+
+def _build_retrieval_dispatcher(
+    *,
+    retrieval_service: RetrievalApplicationService,
+) -> RetrievalAsyncDispatcher:
+    """Собирает dispatcher запуска retrieval в async режиме."""
+
+    provider = os.getenv("APP_ASYNC_PROVIDER", "inline").strip().lower() or "inline"
+
+    if provider == "celery":
+        return CeleryRetrievalAsyncDispatcher(queue_name=os.getenv("APP_CELERY_RETRIEVAL_QUEUE", "retrieval"))
+    if provider == "inline":
+        return InlineRetrievalAsyncDispatcher(
+            runner=lambda task_id, payload: retrieval_service.run_existing_task(
+                task_id=task_id,
+                request=StartRetrievalTaskRequest.model_validate(payload),
+            )
+        )
+
+    raise ValueError(f"Неподдерживаемый APP_ASYNC_PROVIDER: {provider}")
+
+
+def _build_authoring_dispatcher(
+    *,
+    authoring_service: AuthoringApplicationService,
+) -> AuthoringAsyncDispatcher:
+    """Собирает dispatcher запуска authoring в async режиме."""
+
+    provider = os.getenv("APP_ASYNC_PROVIDER", "inline").strip().lower() or "inline"
+
+    if provider == "celery":
+        return CeleryAuthoringAsyncDispatcher(queue_name=os.getenv("APP_CELERY_QUEUE", "authoring"))
+    if provider == "inline":
+        return InlineAuthoringAsyncDispatcher(
+            runner=lambda task_id, payload: authoring_service.run_existing_task(
+                task_id=task_id,
+                request=StartAuthoringTaskRequest.model_validate(payload),
+            ),
+            hitl_runner=lambda task_id, payload: authoring_service.process_hitl_action(
+                task_id=task_id,
+                request=SubmitHitlReviewRequest.model_validate(payload.get("request", {})),
+                action_id=str(payload.get("action_id", "")),
+            ),
+        )
+
+    raise ValueError(f"Неподдерживаемый APP_ASYNC_PROVIDER: {provider}")
+
+
+class ApiContainer:
+    """DI-контейнер API сервиса."""
+
+    def __init__(self) -> None:
+        settings = PostgresSettings.from_env()
+        use_fallback = settings.allow_fallback_persistence
+        checkpoint_store = LangGraphPostgresCheckpointStore.from_settings(
+            settings,
+            use_fallback_if_unset=use_fallback,
+        )
+        registry = PostgresTaskRegistry.from_settings(
+            settings,
+            use_fallback_if_unset=use_fallback,
+        )
+        document_repository = PostgresDocumentRepository.from_settings(
+            settings,
+            use_fallback_if_unset=use_fallback,
+        )
+        artifact_store = PostgresArtifactStore.from_settings(
+            settings,
+            use_fallback_if_unset=use_fallback,
+        )
+        canonical_document_store = PostgresCanonicalDocumentStore.from_settings(
+            settings,
+            use_fallback_if_unset=use_fallback,
+        )
+        task_artifact_registry = PostgresTaskArtifactRegistry.from_settings(
+            settings,
+            use_fallback_if_unset=use_fallback,
+        )
+        hitl_action_store = PostgresHitlActionStore.from_settings(
+            settings,
+            use_fallback_if_unset=use_fallback,
+        )
+        template_store = PostgresTemplateStore.from_settings(
+            settings,
+            use_fallback_if_unset=use_fallback,
+        )
+        configuration_store = PostgresConfigurationStore.from_settings(
+            settings,
+            use_fallback_if_unset=use_fallback,
+        )
+        vector_store = PgVectorStoreAdapter.from_settings(
+            settings,
+            use_fallback_if_unset=use_fallback,
+        )
+        embedding_gateway = TeiEmbeddingGateway.from_env(vector_dim=settings.vector_dim)
+        rerank_gateway = TeiRerankGateway.from_env()
+        llm_runtime_config = _build_llm_runtime_config()
+        task_service = TaskApplicationService(registry=registry, checkpoint_store=checkpoint_store)
+        canonical_document_service = CanonicalDocumentApplicationService(store=canonical_document_store)
+        template_library_service = TemplateLibraryApplicationService(store=template_store)
+        configuration_library_service = ConfigurationLibraryApplicationService(store=configuration_store)
+        retrieval_service = RetrievalApplicationService(
+            task_service=task_service,
+            canonical_document_service=canonical_document_service,
+            embedding_gateway=embedding_gateway,
+            vector_store=vector_store,
+            rerank_gateway=rerank_gateway,
+        )
+
+        self.settings = settings
+        self.task_service = task_service
+        self.document_service = DocumentApplicationService(repository=document_repository)
+        self.canonical_document_service = canonical_document_service
+        self.template_library_service = template_library_service
+        self.configuration_library_service = configuration_library_service
+        self.embedding_gateway = embedding_gateway
+        self.rerank_gateway = rerank_gateway
+        self.vector_store = vector_store
+        self.knowledge_indexing_service = KnowledgeIndexingApplicationService(
+            canonical_document_service=canonical_document_service,
+            parser=_build_canonical_document_parser(),
+            embedding_gateway=embedding_gateway,
+            vector_store=vector_store,
+            quality_policy=_build_knowledge_indexing_quality_policy(),
+            task_service=task_service,
+        )
+        self.artifact_service = ArtifactApplicationService(artifact_store=artifact_store)
+        self.retrieval_service = retrieval_service
+        self.authoring_service = AuthoringApplicationService(
+            task_service=task_service,
+            retrieval_service=retrieval_service,
+            artifact_service=self.artifact_service,
+            task_artifact_registry=task_artifact_registry,
+            hitl_action_store=hitl_action_store,
+            chat_model_gateway=llm_runtime_config.chat_gateway,
+            llm_enabled=llm_runtime_config.enabled,
+            llm_strict_mode=llm_runtime_config.strict,
+            llm_provider=llm_runtime_config.provider,
+            llm_model_name=llm_runtime_config.model_name,
+            hitl_max_iterations=_env_int("APP_HITL_MAX_ITERATIONS", 2),
+            hitl_wait_timeout_sec=_env_int("APP_HITL_WAIT_TIMEOUT_SEC", 1800),
+            template_library_service=template_library_service,
+        )
+        self.authoring_dispatcher = _build_authoring_dispatcher(authoring_service=self.authoring_service)
+        self.knowledge_indexing_dispatcher = _build_knowledge_indexing_dispatcher(
+            knowledge_indexing_service=self.knowledge_indexing_service
+        )
+        self.retrieval_dispatcher = _build_retrieval_dispatcher(retrieval_service=self.retrieval_service)
+
+
+@lru_cache(maxsize=1)
+def get_container() -> ApiContainer:
+    """Возвращает singleton-контейнер API зависимостей."""
+
+    return ApiContainer()
